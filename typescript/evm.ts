@@ -205,7 +205,7 @@ const toUnsigned = (val: bigint): bigint => {
   }
 
   if (val < 0) {
-    return UINT256_CEIL + val;
+    return UINT256_CEIL + (val % UINT256_CEIL);
   }
 
   return val;
@@ -235,6 +235,7 @@ const eqFn = (op1:bigint, op2:bigint):bigint => op1 == op2 ? 1n : 0n;
 const andFn = (op1:bigint, op2:bigint):bigint => op1 & op2;
 const orFn = (op1:bigint, op2:bigint):bigint => op1 | op2;
 const xorFn = (op1:bigint, op2:bigint):bigint => op1 ^ op2;
+const shlFn = (op1:bigint, op2:bigint):bigint => op1 << op2;
 
 export default function evm(code: Uint8Array): OpResult {
   DEBUG && console.log("###", Array.from(code, (byte) => numberToHexFormatted(byte)), "###")
@@ -251,10 +252,10 @@ export default function evm(code: Uint8Array): OpResult {
         let result = opFn(op1, op2);
         DEBUG && console.log(`result (raw) ${numberToHexFormatted(result)}`)
 
-        // clamp during final iteration
+        // convert to unsigned uint256 during final iteration
         if (i === operations.length - 1) {
           result = toUnsigned(result);
-          DEBUG && console.log(`result (clamped) ${numberToHexFormatted(result)}`)
+          DEBUG && console.log(`result (unsigned) ${numberToHexFormatted(result)}`)
         }
 
         stack.unshift(result);
@@ -271,7 +272,6 @@ export default function evm(code: Uint8Array): OpResult {
     const opcode = code[pc];
     pc++;
     const exec2op = curry(exec2)(opcode)
-
     DEBUG && console.log(`Op ${debugOpcode(opcode)}`)
 
     if (opcode >= OPCODES.PUSH1 && opcode <= OPCODES.PUSH32) {
@@ -328,11 +328,11 @@ export default function evm(code: Uint8Array): OpResult {
           return exec2op(eqFn);
         case OPCODES.ISZERO:
           stack.unshift(stack.shift() == 0n ? 1n : 0n)
-          DEBUG && console.log("IsZero", numberToHexFormatted(stack[0]));
+          DEBUG && console.log("Result", numberToHexFormatted(stack[0]));
           break;
         case OPCODES.NOT:
           stack.unshift(toUnsigned(~stack.shift()!))
-          DEBUG && console.log("IsZero", numberToHexFormatted(stack[0]));
+          DEBUG && console.log("Result", numberToHexFormatted(stack[0]));
           break;
         case OPCODES.AND:
           return exec2op(andFn);
@@ -340,6 +340,8 @@ export default function evm(code: Uint8Array): OpResult {
           return exec2op(orFn);
         case OPCODES.XOR:
           return exec2op(xorFn);
+        case OPCODES.SHL:
+          return exec2op(shlFn);
       }
     }
   }
