@@ -12,6 +12,8 @@
  * - Use Jest Watch Mode to run tests when files change: `yarn test --watchAll`
  */
 
+const DEBUG = true;
+
 const OPCODES = {
   STOP: 0x00,
   ADD: 0x01,
@@ -170,38 +172,70 @@ declare interface OpResult {
   stack: bigint[]
 }
 
+const numberToHexFormatted = (num: bigint | number | undefined): string => {
+  if (num === undefined) return "undefined"
+  const isNegative = num < 0;
+  const numAbs = isNegative ? BigInt(num) * -1n : num;
+  return `${isNegative ? "-" : ''}0x${numAbs < 16 ? '0' : ''}${numAbs.toString(16)}`;
+}
+
+const debugOpcode = (opcode: number): string => {
+  return `${OPNAMES[opcode]} (${numberToHexFormatted(opcode)})`;
+}
+
 const shouldPush = function(opcode: number): boolean {
   return opcode >= OPCODES.PUSH1 && opcode <= OPCODES.PUSH32;
 }
 
 const error = (opcode: number, currentStack: bigint[], message: string = ""): OpResult => {
-  console.log(`Operation ${OPNAMES[opcode]} (${opcode.toString(16)}) on invalid stack`, currentStack);
+  DEBUG && console.log(`Operation ${debugOpcode(opcode)} on invalid stack`, currentStack);
   return {success: false, stack: []}
 }
 
+const addFn = (op1:bigint, op2:bigint):bigint => op1 + op2;
+const subFn = (op1:bigint, op2:bigint):bigint => op1 - op2;
+const mulFn = (op1:bigint, op2:bigint):bigint => op1 * op2;
+const divFn = (op1:bigint, op2:bigint):bigint => op2 == 0n ? 0n : op1 / op2;
+const modFn = (op1:bigint, op2:bigint):bigint => op2 == 0n ? 0n : op1 % op2;
+
 export default function evm(code: Uint8Array): OpResult {
+  DEBUG && console.log("###", Array.from(code, (byte) => numberToHexFormatted(byte)), "###")
   let pc = 0;
   let stack:bigint[] = [];
 
-  const exec2 = (opcode:number, operation: (op1:bigint, op2:bigint) => bigint): OpResult => {
-    const op1 = stack.shift();
-    const op2 = stack.shift();
-    if (op1 && op2) {
-      // console.log("Op1", op1.toString(16))
-      // console.log("Op2", op2.toString(16))
-      // console.log("Max", UINT256_MAX_VALUE.toString(16))
-      stack.unshift(operation(op1, op2) % (UINT256_MAX_VALUE + 1n));
-      return { success: true, stack }
-    } else {
-      return error(opcode, stack)
+  const exec2 = (opcode:number, ...operations: ((op1:bigint, op2:bigint) => bigint)[]): OpResult => {
+    for (let i = 0; i < operations.length; i++) {
+      const opFn = operations[i];
+      const op1 = stack.shift();
+      const op2 = stack.shift();
+      DEBUG && console.log(`exec2 ${debugOpcode(opcode)} operands ${numberToHexFormatted(op1)} ${numberToHexFormatted(op2)}`)
+      if (op1 !== undefined && op2 !== undefined) {
+        let result = opFn(op1, op2);
+        DEBUG && console.log(`result (raw) ${numberToHexFormatted(result)}`)
+        // overflow
+        if (result > UINT256_MAX_VALUE) {
+          result = result % (UINT256_MAX_VALUE + 1n);
+        }
+        // underflow
+        if (result < 0) {
+          result = UINT256_MAX_VALUE - 1n - result;
+        }
+        DEBUG && console.log(`result ${numberToHexFormatted(result)}`)
+        stack.unshift(result);
+        DEBUG && console.log(`stack is now`, stack)
+      } else {
+        return error(opcode, stack)
+      }
     }
+
+    return { success: true, stack }
   }
 
   while (pc < code.length) {
     const opcode = code[pc];
     pc++;
 
-    console.log("Opcode", OPNAMES[opcode], opcode.toString(16))
+    DEBUG && console.log(`Op ${debugOpcode(opcode)}`)
 
     if (shouldPush(opcode)) {
       let argument = BigInt(code[pc]);
@@ -212,25 +246,31 @@ export default function evm(code: Uint8Array): OpResult {
         argument = (argument << 8n) | BigInt(code[pc]);
         pc++;
       }
-      console.log(">> Push", argument.toString(16))
+      DEBUG && console.log("Push", numberToHexFormatted(argument));
       stack.unshift(argument)
     } else {
       switch (opcode) {
         case OPCODES.POP:
           const popped = stack.shift();
-          // console.log(`Pop ${popped}`)
+          DEBUG && console.log("Pop", numberToHexFormatted(popped));
           break;
         case OPCODES.STOP:
           pc = code.length;
           break;
         case OPCODES.ADD:
-          return exec2(opcode, (op1, op2) => op1 + op2);
+          return exec2(opcode, addFn);
         case OPCODES.MUL:
-          return exec2(opcode, (op1, op2) => op1 * op2);
+          return exec2(opcode, mulFn);
         case OPCODES.SUB:
-          return exec2(opcode, (op1, op2) => op1 - op2);
+          return exec2(opcode, subFn);
         case OPCODES.DIV:
-          return exec2(opcode, (op1, op2) => op1 / op2);
+          return exec2(opcode, divFn);
+        case OPCODES.MOD:
+          return exec2(opcode, modFn);
+        case OPCODES.ADDMOD:
+          return exec2(opcode, addFn, modFn);
+        case OPCODES.MULMOD:
+          return exec2(opcode, mulFn, modFn);
       }
     }
   }
