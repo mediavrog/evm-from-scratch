@@ -165,11 +165,20 @@ const OPNAMES = Object.entries(OPCODES).reduce((agg, cur) => {
   return agg
 }, {})
 
-const UINT256_MAX_VALUE = 2n**256n - 1n;
+const UINT256_CEIL = 2n**256n;
+const INT128_CEIL = 2n**128n;
 
 declare interface OpResult {
   success: boolean,
   stack: bigint[]
+}
+
+function curry(f) { // curry(f) does the currying transform
+  return function(a) {
+    return function(...b) {
+      return f(a, ...b);
+    };
+  };
 }
 
 const numberToHexFormatted = (num: bigint | number | undefined): string => {
@@ -183,20 +192,49 @@ const debugOpcode = (opcode: number): string => {
   return `${OPNAMES[opcode]} (${numberToHexFormatted(opcode)})`;
 }
 
-const shouldPush = function(opcode: number): boolean {
-  return opcode >= OPCODES.PUSH1 && opcode <= OPCODES.PUSH32;
-}
-
 const error = (opcode: number, currentStack: bigint[], message: string = ""): OpResult => {
   DEBUG && console.log(`Operation ${debugOpcode(opcode)} on invalid stack`, currentStack);
   return {success: false, stack: []}
+}
+
+const toSigned = (val: bigint): bigint => val < INT128_CEIL ? val : (UINT256_CEIL - val) * -1n;
+
+const toUnsigned = (val: bigint): bigint => {
+  if (val >= UINT256_CEIL) {
+    return val % UINT256_CEIL;
+  }
+
+  if (val < 0) {
+    return UINT256_CEIL + val;
+  }
+
+  return val;
 }
 
 const addFn = (op1:bigint, op2:bigint):bigint => op1 + op2;
 const subFn = (op1:bigint, op2:bigint):bigint => op1 - op2;
 const mulFn = (op1:bigint, op2:bigint):bigint => op1 * op2;
 const divFn = (op1:bigint, op2:bigint):bigint => op2 == 0n ? 0n : op1 / op2;
-const modFn = (op1:bigint, op2:bigint):bigint => op2 == 0n ? 0n : op1 % op2;
+const modFn = (val:bigint, mod:bigint):bigint => mod == 0n ? 0n : val % mod;
+const expFn = (val:bigint, exp:bigint):bigint => val ** exp;
+const sextFn = (byteNum:bigint, val:bigint):bigint => {
+  const signBit = val >> ((byteNum + 1n) * 8n) - 1n;
+  if (signBit === 1n) { // negative
+    return (UINT256_CEIL - 1n) | val;
+  } else {
+    return val;
+  }
+}
+const sdivFn = (op1:bigint, op2:bigint):bigint => divFn(toSigned(op1), toSigned(op2));
+const smodFn = (op1:bigint, op2:bigint):bigint => modFn(toSigned(op1), toSigned(op2));
+const ltFn = (op1:bigint, op2:bigint):bigint => op1 < op2 ? 1n : 0n;
+const gtFn = (op1:bigint, op2:bigint):bigint => op1 > op2 ? 1n : 0n;
+const sltFn = (op1:bigint, op2:bigint):bigint => ltFn(toSigned(op1), toSigned(op2));
+const sgtFn = (op1:bigint, op2:bigint):bigint => gtFn(toSigned(op1), toSigned(op2));
+const eqFn = (op1:bigint, op2:bigint):bigint => op1 == op2 ? 1n : 0n;
+const andFn = (op1:bigint, op2:bigint):bigint => op1 & op2;
+const orFn = (op1:bigint, op2:bigint):bigint => op1 | op2;
+const xorFn = (op1:bigint, op2:bigint):bigint => op1 ^ op2;
 
 export default function evm(code: Uint8Array): OpResult {
   DEBUG && console.log("###", Array.from(code, (byte) => numberToHexFormatted(byte)), "###")
@@ -212,15 +250,13 @@ export default function evm(code: Uint8Array): OpResult {
       if (op1 !== undefined && op2 !== undefined) {
         let result = opFn(op1, op2);
         DEBUG && console.log(`result (raw) ${numberToHexFormatted(result)}`)
-        // overflow
-        if (result > UINT256_MAX_VALUE) {
-          result = result % (UINT256_MAX_VALUE + 1n);
+
+        // clamp during final iteration
+        if (i === operations.length - 1) {
+          result = toUnsigned(result);
+          DEBUG && console.log(`result (clamped) ${numberToHexFormatted(result)}`)
         }
-        // underflow
-        if (result < 0) {
-          result = UINT256_MAX_VALUE - 1n - result;
-        }
-        DEBUG && console.log(`result ${numberToHexFormatted(result)}`)
+
         stack.unshift(result);
         DEBUG && console.log(`stack is now`, stack)
       } else {
@@ -234,10 +270,11 @@ export default function evm(code: Uint8Array): OpResult {
   while (pc < code.length) {
     const opcode = code[pc];
     pc++;
+    const exec2op = curry(exec2)(opcode)
 
     DEBUG && console.log(`Op ${debugOpcode(opcode)}`)
 
-    if (shouldPush(opcode)) {
+    if (opcode >= OPCODES.PUSH1 && opcode <= OPCODES.PUSH32) {
       let argument = BigInt(code[pc]);
       pc++;
 
@@ -258,19 +295,51 @@ export default function evm(code: Uint8Array): OpResult {
           pc = code.length;
           break;
         case OPCODES.ADD:
-          return exec2(opcode, addFn);
+          return exec2op(addFn);
         case OPCODES.MUL:
-          return exec2(opcode, mulFn);
+          return exec2op(mulFn);
         case OPCODES.SUB:
-          return exec2(opcode, subFn);
+          return exec2op(subFn);
         case OPCODES.DIV:
-          return exec2(opcode, divFn);
+          return exec2op(divFn);
         case OPCODES.MOD:
-          return exec2(opcode, modFn);
+          return exec2op(modFn);
         case OPCODES.ADDMOD:
-          return exec2(opcode, addFn, modFn);
+          return exec2op(addFn, modFn);
         case OPCODES.MULMOD:
-          return exec2(opcode, mulFn, modFn);
+          return exec2op(mulFn, modFn);
+        case OPCODES.EXP:
+          return exec2op(expFn);
+        case OPCODES.SIGNEXTEND:
+          return exec2op(sextFn);
+        case OPCODES.SDIV:
+          return exec2op(sdivFn);
+        case OPCODES.SMOD:
+          return exec2op(smodFn);
+        case OPCODES.LT:
+          return exec2op(ltFn);
+        case OPCODES.GT:
+          return exec2op(gtFn);
+        case OPCODES.SLT:
+          return exec2op(sltFn);
+        case OPCODES.SGT:
+          return exec2op(sgtFn);
+        case OPCODES.EQ:
+          return exec2op(eqFn);
+        case OPCODES.ISZERO:
+          stack.unshift(stack.shift() == 0n ? 1n : 0n)
+          DEBUG && console.log("IsZero", numberToHexFormatted(stack[0]));
+          break;
+        case OPCODES.NOT:
+          stack.unshift(toUnsigned(~stack.shift()!))
+          DEBUG && console.log("IsZero", numberToHexFormatted(stack[0]));
+          break;
+        case OPCODES.AND:
+          return exec2op(andFn);
+        case OPCODES.OR:
+          return exec2op(orFn);
+        case OPCODES.XOR:
+          return exec2op(xorFn);
       }
     }
   }
