@@ -166,7 +166,6 @@ const OPNAMES = Object.entries(OPCODES).reduce((agg, cur) => {
 }, {})
 
 const UINT256_CEIL = 2n**256n;
-const INT128_CEIL = 2n**128n;
 
 declare interface OpResult {
   success: boolean,
@@ -197,7 +196,9 @@ const error = (opcode: number, currentStack: bigint[], message: string = ""): Op
   return {success: false, stack: []}
 }
 
-const toSigned = (val: bigint): bigint => val < INT128_CEIL ? val : (UINT256_CEIL - val) * -1n;
+const toBigInt = (val: boolean): bigint => val ? 1n : 0n
+
+const toSigned = (val: bigint): bigint => val < UINT256_CEIL / 2n ? val : (UINT256_CEIL - val) * -1n;
 
 const toUnsigned = (val: bigint): bigint => {
   if (val >= UINT256_CEIL) {
@@ -211,6 +212,10 @@ const toUnsigned = (val: bigint): bigint => {
   return val;
 }
 
+const isPush = (opcode: number): boolean => opcode >= OPCODES.PUSH1 && opcode <= OPCODES.PUSH32;
+const isDup = (opcode: number): boolean => opcode >= OPCODES.DUP1 && opcode <= OPCODES.DUP16;
+const isSwap = (opcode: number): boolean => opcode >= OPCODES.SWAP1 && opcode <= OPCODES.SWAP16;
+
 const addFn = (op1:bigint, op2:bigint):bigint => op1 + op2;
 const subFn = (op1:bigint, op2:bigint):bigint => op1 - op2;
 const mulFn = (op1:bigint, op2:bigint):bigint => op1 * op2;
@@ -219,23 +224,25 @@ const modFn = (val:bigint, mod:bigint):bigint => mod == 0n ? 0n : val % mod;
 const expFn = (val:bigint, exp:bigint):bigint => val ** exp;
 const sextFn = (byteNum:bigint, val:bigint):bigint => {
   const signBit = val >> ((byteNum + 1n) * 8n) - 1n;
-  if (signBit === 1n) { // negative
-    return (UINT256_CEIL - 1n) | val;
-  } else {
-    return val;
-  }
+  return signBit === 1n /* negative */ ? (UINT256_CEIL - 1n) | val : val;
 }
 const sdivFn = (op1:bigint, op2:bigint):bigint => divFn(toSigned(op1), toSigned(op2));
-const smodFn = (op1:bigint, op2:bigint):bigint => modFn(toSigned(op1), toSigned(op2));
-const ltFn = (op1:bigint, op2:bigint):bigint => op1 < op2 ? 1n : 0n;
-const gtFn = (op1:bigint, op2:bigint):bigint => op1 > op2 ? 1n : 0n;
+const smodFn = (val:bigint, mod:bigint):bigint => modFn(toSigned(val), toSigned(mod));
+const ltFn = (op1:bigint, op2:bigint):bigint => toBigInt(op1 < op2);
+const gtFn = (op1:bigint, op2:bigint):bigint => toBigInt(op1 > op2);
 const sltFn = (op1:bigint, op2:bigint):bigint => ltFn(toSigned(op1), toSigned(op2));
 const sgtFn = (op1:bigint, op2:bigint):bigint => gtFn(toSigned(op1), toSigned(op2));
-const eqFn = (op1:bigint, op2:bigint):bigint => op1 == op2 ? 1n : 0n;
+const eqFn = (op1:bigint, op2:bigint):bigint => toBigInt(op1 == op2);
 const andFn = (op1:bigint, op2:bigint):bigint => op1 & op2;
 const orFn = (op1:bigint, op2:bigint):bigint => op1 | op2;
 const xorFn = (op1:bigint, op2:bigint):bigint => op1 ^ op2;
-const shlFn = (op1:bigint, op2:bigint):bigint => op1 << op2;
+const shlFn = (bitNum:bigint, val:bigint):bigint => {
+  let mask = (UINT256_CEIL - 1n) >> bitNum;
+  return (val & mask) << bitNum
+};
+const shrFn = (bitNum:bigint, val:bigint):bigint => val >> bitNum;
+const sarFn = (bitNum:bigint, val:bigint):bigint => shrFn(bitNum, toSigned(val));
+const byteFn = (byteNum:bigint, val:bigint):bigint => shrFn(256n - 8n /* 1 byte in bits */ - byteNum * 8n, val) & 0xFFn
 
 export default function evm(code: Uint8Array): OpResult {
   DEBUG && console.log("###", Array.from(code, (byte) => numberToHexFormatted(byte)), "###")
@@ -268,23 +275,59 @@ export default function evm(code: Uint8Array): OpResult {
     return { success: true, stack }
   }
 
+  const peek = (): bigint | undefined => {
+    const topEl = stack.length > 0 ? stack[0] : undefined;
+    DEBUG && console.log("Peek Top", numberToHexFormatted(topEl));
+    return topEl;
+  }
+
+  const validJumpDestinations = new Set();
+  for (let i = 0; i < code.length;) {
+    const opcode = code[i];
+    if (opcode == OPCODES.JUMPDEST) validJumpDestinations.add(BigInt(i));
+    i += isPush(opcode) ? 2 : 1;
+  }
+
+  const jump = (destination: BigInt | undefined): boolean => {
+    DEBUG && console.log("Valid JUMP destinations", validJumpDestinations);
+    DEBUG && console.log("Destination", destination, "valid?", validJumpDestinations.has(destination));
+    if (validJumpDestinations.has(destination)) {
+      pc = Number(destination);
+      return true;
+    } else {
+      return false;
+    }
+  }
+
   while (pc < code.length) {
     const opcode = code[pc];
-    pc++;
-    const exec2op = curry(exec2)(opcode)
+    const exec2op = curry(exec2)(opcode);
     DEBUG && console.log(`Op ${debugOpcode(opcode)}`)
 
-    if (opcode >= OPCODES.PUSH1 && opcode <= OPCODES.PUSH32) {
-      let argument = BigInt(code[pc]);
-      pc++;
-
+    if (isPush(opcode)) { // PUSHX
+      let argument = BigInt(code[++pc]);
       const endIdx = pc + opcode - OPCODES.PUSH1;
       while(pc < endIdx) {
-        argument = (argument << 8n) | BigInt(code[pc]);
-        pc++;
+        argument = (argument << 8n) | BigInt(code[++pc]);
       }
       DEBUG && console.log("Push", numberToHexFormatted(argument));
       stack.unshift(argument)
+    } else if (isDup(opcode)) { // DUPX
+      const index = opcode - OPCODES.DUP1;
+      if (stack.length > index) {
+        stack.unshift(stack[index]);
+      } else {
+        error(opcode, stack);
+      }
+    } else if (isSwap(opcode)) { // SWAPX
+      const index = opcode - OPCODES.SWAP1 + 1;
+      if (stack.length > index) {
+        const tmp = stack[index];
+        stack[index] = stack[0];
+        stack[0] = tmp;
+      } else {
+        error(opcode, stack);
+      }
     } else {
       switch (opcode) {
         case OPCODES.POP:
@@ -327,12 +370,12 @@ export default function evm(code: Uint8Array): OpResult {
         case OPCODES.EQ:
           return exec2op(eqFn);
         case OPCODES.ISZERO:
-          stack.unshift(stack.shift() == 0n ? 1n : 0n)
-          DEBUG && console.log("Result", numberToHexFormatted(stack[0]));
+          stack.unshift(stack.shift() == 0n ? 1n : 0n);
+          peek();
           break;
         case OPCODES.NOT:
           stack.unshift(toUnsigned(~stack.shift()!))
-          DEBUG && console.log("Result", numberToHexFormatted(stack[0]));
+          peek();
           break;
         case OPCODES.AND:
           return exec2op(andFn);
@@ -342,8 +385,36 @@ export default function evm(code: Uint8Array): OpResult {
           return exec2op(xorFn);
         case OPCODES.SHL:
           return exec2op(shlFn);
+        case OPCODES.SHR:
+          return exec2op(shrFn);
+        case OPCODES.SAR:
+          return exec2op(sarFn);
+        case OPCODES.BYTE:
+          return exec2op(byteFn);
+        case OPCODES.INVALID:
+          return error(opcode, stack);
+        case OPCODES.PC:
+          stack.unshift(BigInt(pc));
+          peek();
+          break;
+        case OPCODES.GAS:
+          stack.unshift(UINT256_CEIL - 1n);
+          peek();
+          break;
+        case OPCODES.JUMP:
+          if (!jump(stack.shift())) return error(opcode, stack);
+          break;
+        case OPCODES.JUMPI:
+          const destination = stack.shift();
+          const conditional = stack.shift();
+          if (conditional !== 0n) {
+            if (!jump(destination)) return error(opcode, stack);
+          }
+          // no error if JUMPI doesn't jump due to conditional
+          break;
       }
     }
+    pc++;
   }
 
   return { success: true, stack };
