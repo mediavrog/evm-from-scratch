@@ -163,7 +163,43 @@ const OPCODES = {
 const OPNAMES = Object.entries(OPCODES).reduce((agg, cur) => {
   agg[cur[1]] = cur[0];
   return agg
-}, {})
+}, {});
+
+class Memory {
+  data: Uint8Array;
+  msize: bigint;
+
+  constructor(size: number = 1024 * 1024) {
+    this.data = new Uint8Array(size);
+    this.msize = 0n;
+  }
+
+  updateMsize(offset, readSize = 0) {
+    const offsetMsize = Math.ceil((Number(offset) + readSize) / 32) * 32;
+    if(offsetMsize > this.msize) this.msize = BigInt(offsetMsize);
+  }
+
+  store(offset, value) {
+    for (let i = 0n; i < 32n; i++) {
+      this.data[Number(offset + i)] = Number((value >> ((32n - i - 1n) * 8n)) & 0xffn);
+    }
+    this.updateMsize(offset);
+  }
+
+  store8(offset, value) {
+    this.data[Number(offset)] = Number(value & 0xffn);
+    this.updateMsize(offset);
+  }
+
+  load(offset) {
+    let value = 0n;
+    for (let i = 0n; i < 32n; i++) {
+      value = (value << 8n) | BigInt(this.data[Number(offset + i)]);
+    }
+    this.updateMsize(offset, 32);
+    return value;
+  }
+}
 
 const UINT256_CEIL = 2n**256n;
 
@@ -191,7 +227,7 @@ const debugOpcode = (opcode: number): string => {
   return `${OPNAMES[opcode]} (${numberToHexFormatted(opcode)})`;
 }
 
-const error = (opcode: number, currentStack: bigint[], message: string = ""): OpResult => {
+const error = (opcode: number, currentStack: bigint[]): OpResult => {
   DEBUG && console.log(`Operation ${debugOpcode(opcode)} on invalid stack`, currentStack);
   return {success: false, stack: []}
 }
@@ -247,7 +283,8 @@ const byteFn = (byteNum:bigint, val:bigint):bigint => shrFn(256n - 8n /* 1 byte 
 export default function evm(code: Uint8Array): OpResult {
   DEBUG && console.log("###", Array.from(code, (byte) => numberToHexFormatted(byte)), "###")
   let pc = 0;
-  let stack:bigint[] = [];
+  const stack:bigint[] = [];
+  const mem = new Memory();
 
   const exec2 = (opcode:number, ...operations: ((op1:bigint, op2:bigint) => bigint)[]): OpResult => {
     for (let i = 0; i < operations.length; i++) {
@@ -287,9 +324,9 @@ export default function evm(code: Uint8Array): OpResult {
     if (opcode == OPCODES.JUMPDEST) validJumpDestinations.add(BigInt(i));
     i += isPush(opcode) ? 2 : 1;
   }
+  DEBUG && console.log("Valid JUMP destinations", validJumpDestinations);
 
   const jump = (destination: BigInt | undefined): boolean => {
-    DEBUG && console.log("Valid JUMP destinations", validJumpDestinations);
     DEBUG && console.log("Destination", destination, "valid?", validJumpDestinations.has(destination));
     if (validJumpDestinations.has(destination)) {
       pc = Number(destination);
@@ -411,6 +448,22 @@ export default function evm(code: Uint8Array): OpResult {
             if (!jump(destination)) return error(opcode, stack);
           }
           // no error if JUMPI doesn't jump due to conditional
+          break;
+        case OPCODES.MSTORE:
+          mem.store(stack.shift(), stack.shift());
+          DEBUG && console.log("Memory", mem.data);
+          break;
+        case OPCODES.MSTORE8:
+          mem.store8(stack.shift(), stack.shift());
+          DEBUG && console.log("Memory", mem.data);
+          break;
+        case OPCODES.MLOAD:
+          stack.unshift(mem.load(stack.shift()));
+          DEBUG && console.log("Memory", mem.data);
+          break;
+        case OPCODES.MSIZE:
+          stack.unshift(mem.msize);
+          DEBUG && console.log("Memory", mem.data);
           break;
       }
     }
