@@ -268,6 +268,7 @@ const isPush = (opcode: number): boolean => opcode >= OPCODES.PUSH1 && opcode <=
 const isDup = (opcode: number): boolean => opcode >= OPCODES.DUP1 && opcode <= OPCODES.DUP16;
 const isSwap = (opcode: number): boolean => opcode >= OPCODES.SWAP1 && opcode <= OPCODES.SWAP16;
 const isLog = (opcode: number): boolean => opcode >= OPCODES.LOG0 && opcode <= OPCODES.LOG4;
+const isCreate = (opcode: number): boolean => opcode === OPCODES.CREATE || opcode === OPCODES.CREATE2;
 
 const addFn = (op1:bigint, op2:bigint):bigint => op1 + op2;
 const subFn = (op1:bigint, op2:bigint):bigint => op1 - op2;
@@ -314,6 +315,7 @@ export default function evm(
     tx: TransactionData,
     block: BlockData,
     state: StateData,
+    contextWritable: boolean = true
 ): OpResult {
   DEBUG && console.log("###", Array.from(code, (byte) => numberToHexFormatted(byte)), "###")
   let pc = 0;
@@ -321,6 +323,7 @@ export default function evm(
   const logs:LogEntry[] = [];
   const mem = new Memory();
   let returnValue: bigint | undefined = undefined;
+  let lastSubReturn: bigint | undefined = undefined;
 
   const exec2 = (opcode:number, ...operations: ((op1:bigint, op2:bigint) => bigint)[]): OpResult => {
     for (let i = 0; i < operations.length; i++) {
@@ -401,7 +404,53 @@ export default function evm(
       } else {
         error(opcode, stack);
       }
+    } else if (isCreate(opcode)) { // CREATEX
+      if (!contextWritable) return error(opcode, stack)
+
+      const value = stack.shift()!;
+      const offset = stack.shift()!;
+      const size = stack.shift()!;
+
+      // TODO: proper address generation and handle deterministic generation with CREATE2
+      const address = BigInt(0xFF);
+
+      const code = mem.load(offset, size).toString(16);
+      const codeSub = hexStringToUint8Array(code);
+
+      const result = evm(
+          codeSub,
+          tx,
+          block,
+          {
+            [numberToHexFormatted(address)]: {
+              balance: value.toString(16),
+              nonce: "0",
+              code: {
+                bin: code
+              },
+              storage: { }
+            }
+          }
+      )
+
+      if(result.success) {
+        DEBUG && console.log("Create with code", code, result)
+        state[numberToHexFormatted(address)] = {
+          balance: value.toString(16),
+          nonce: "0",
+          code: {
+            bin: result.return ? result.return.toString(16) : ""
+          },
+          storage: { }
+        }
+
+        stack.unshift(address);
+      } else {
+        stack.unshift(0n);
+      }
     } else if(isLog(opcode)) {
+      if (!contextWritable) return error(opcode, stack)
+
       const offset = stack.shift();
       const length = stack.shift();
       const value = mem.load(offset, length);
@@ -519,6 +568,8 @@ export default function evm(
           DEBUG && console.log("Memory", mem.data);
           break;
         case OPCODES.SSTORE:
+          if (!contextWritable) return error(opcode, stack)
+
           storage.store(stack.shift(), stack.shift());
           DEBUG && console.log("Storage", storage.data);
           break;
@@ -662,6 +713,83 @@ export default function evm(
           const codeData = loadFromUint8ArrayFn(code, byteOffsetCode, sizeCode);
           mem.store(destOffsetCode, codeData, sizeCode);
           break;
+        case OPCODES.STATICCALL:
+        case OPCODES.DELEGATECALL:
+        case OPCODES.CALL: {
+          if (opcode === OPCODES.CALL && !contextWritable) return error(opcode, stack)
+
+          const gas = stack.shift()!;
+          const address = stack.shift()!;
+          const value = opcode === OPCODES.CALL ? stack.shift()! : tx.value;
+          const argsOffset = stack.shift()!;
+          const argsSize = stack.shift()!;
+          const retOffset = stack.shift()!;
+          const retSize = stack.shift()!;
+
+          const dataSub = hexStringToUint8Array(mem.load(argsOffset, argsSize).toString(16));
+          const codeRaw = state[numberToHexFormatted(address)]?.code?.bin || "";
+          const codeSub = hexStringToUint8Array(codeRaw);
+
+          const addressSub = opcode === OPCODES.DELEGATECALL ? tx.address : address;
+          const callerSub = opcode === OPCODES.DELEGATECALL ? tx.caller : tx.address;
+          const originSub = opcode === OPCODES.DELEGATECALL ? tx.origin : tx.address;
+
+          const txSub = {
+            address: addressSub,
+            caller: callerSub,
+            origin: originSub,
+            gasPrice: gas,
+            value,
+            data: dataSub,
+          } as TransactionData;
+
+          const result = evm(
+              codeSub,
+              txSub,
+              block,
+              state,
+              opcode !== OPCODES.STATICCALL
+          )
+
+          if (result.return) {
+            mem.store(retOffset, result.return, retSize);
+            lastSubReturn = result.return;
+          } else {
+            lastSubReturn = undefined;
+          }
+          stack.unshift(toBigInt(result.success))
+          break;
+        }
+        case OPCODES.RETURNDATASIZE: {
+          const lastReturnSize = lastSubReturn ? lastSubReturn.toString(16).length / 2 : 0;
+          stack.unshift(BigInt(lastReturnSize));
+          break;
+        }
+        case OPCODES.RETURNDATACOPY: {
+          const destOffset = stack.shift();
+          const byteOffset = stack.shift();
+          const size = stack.shift();
+          const returndata = loadFromUint8ArrayFn(hexStringToUint8Array(lastSubReturn!.toString(16)), byteOffset, size);
+          mem.store(destOffset, returndata, size);
+          break;
+        }
+        case OPCODES.SELFDESTRUCT: {
+          if (!contextWritable) return error(opcode, stack)
+
+          const address = stack.shift()!;
+
+          console.log("Sending funds from ", numberToHexFormatted(tx.address), "to", numberToHexFormatted(address), state)
+          // TODO: only alter state if address already exists with a state
+          state[numberToHexFormatted(address)] = {
+            balance: state[numberToHexFormatted(tx.address)].balance,
+            nonce: "0",
+            code: {},
+            storage: {}
+          };
+
+          delete state[numberToHexFormatted(tx.address)]
+          break;
+        }
       }
     }
     pc++;
