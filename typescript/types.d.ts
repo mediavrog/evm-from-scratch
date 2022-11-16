@@ -21,7 +21,7 @@ export interface StateData {
   [key: string] : {
     balance: string,
     nonce: string,
-    code: string,
+    code: {[key: string]: string},
     storage: {[key: string]: string}
   }
 }

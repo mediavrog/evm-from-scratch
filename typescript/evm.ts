@@ -215,6 +215,12 @@ function curry(f) { // curry(f) does the currying transform
   };
 }
 
+function hexStringToUint8Array(hexString: string) {
+  return new Uint8Array(
+      (hexString?.match(/../g) || []).map((byte) => parseInt(byte, 16))
+  );
+}
+
 const numberToHexFormatted = (num: bigint | number | undefined): string => {
   if (num === undefined) return "undefined"
   const isNegative = num < 0;
@@ -279,7 +285,7 @@ const shrFn = (bitNum:bigint, val:bigint):bigint => val >> bitNum;
 const sarFn = (bitNum:bigint, val:bigint):bigint => shrFn(bitNum, toSigned(val));
 const byteFn = (byteNum:bigint, val:bigint):bigint => shrFn(256n - 8n /* 1 byte in bits */ - byteNum * 8n, val) & 0xFFn
 
-const cdLoadFn = (data: Uint8Array, byteOffset: bigint | undefined, size: bigint = 32n): bigint => {
+const loadFromUint8ArrayFn = (data: Uint8Array, byteOffset: bigint | undefined, size: bigint = 32n): bigint => {
   const offset = byteOffset || 0n;
   let value = 0n;
   for (let i = 0n; i < size; i++) {
@@ -511,14 +517,14 @@ export default function evm(
           peek();
           break;
         case OPCODES.CALLDATALOAD:
-          stack.unshift(cdLoadFn(tx.data, stack.shift()));
+          stack.unshift(loadFromUint8ArrayFn(tx.data, stack.shift()));
           peek();
           break;
         case OPCODES.CALLDATACOPY:
           const destOffset = stack.shift();
           const byteOffset = stack.shift();
           const size = stack.shift();
-          const calldata = cdLoadFn(tx.data, byteOffset, size);
+          const calldata = loadFromUint8ArrayFn(tx.data, byteOffset, size);
           mem.store(destOffset, calldata, size);
           break;
         case OPCODES.CALLDATASIZE:
@@ -558,9 +564,55 @@ export default function evm(
           stack.unshift(BigInt(state[numberToHexFormatted(address)]?.balance || 0))
           peek();
           break;
+        case OPCODES.SELFBALANCE: {
+          const address = tx.address;
+          stack.unshift(BigInt(state[numberToHexFormatted(address)]?.balance || 0))
+          peek();
+          break;
+        }
+        case OPCODES.EXTCODESIZE: {
+          const address = stack.shift()!;
+          const code = state[numberToHexFormatted(address)]?.code?.bin || "";
+          const codeArr = hexStringToUint8Array(code)
+          stack.unshift(BigInt(codeArr.length))
+          peek();
+          break;
+        }
+        case OPCODES.EXTCODECOPY: {
+          const address = stack.shift()!;
+          const codeRaw = state[numberToHexFormatted(address)]?.code?.bin || "";
+          const code = hexStringToUint8Array(codeRaw)
+
+          const destOffsetCode = stack.shift();
+          const byteOffsetCode = stack.shift();
+          const sizeCode = stack.shift();
+          const codeData = loadFromUint8ArrayFn(code, byteOffsetCode, sizeCode);
+          mem.store(destOffsetCode, codeData, sizeCode);
+          break;
+        }
+        case OPCODES.EXTCODEHASH: {
+          const address = stack.shift()!;
+          const code = state[numberToHexFormatted(address)]?.code?.bin || "";
+          if (code.length) {
+            const value = `0x${code}`;
+            const hashed = ethers.utils.keccak256(value);
+            stack.unshift(BigInt(hashed));
+          } else {
+            stack.unshift(0n);
+          }
+          peek();
+          break;
+        }
         case OPCODES.CODESIZE:
           stack.unshift(BigInt(code.length))
           peek();
+          break;
+        case OPCODES.CODECOPY:
+          const destOffsetCode = stack.shift();
+          const byteOffsetCode = stack.shift();
+          const sizeCode = stack.shift();
+          const codeData = loadFromUint8ArrayFn(code, byteOffsetCode, sizeCode);
+          mem.store(destOffsetCode, codeData, sizeCode);
           break;
       }
     }
