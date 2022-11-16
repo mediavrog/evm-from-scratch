@@ -1,3 +1,5 @@
+import {ethers} from "ethers";
+import {BlockData, StateData, TransactionData} from "./types";
 /**
  * EVM From Scratch
  * TypeScript template
@@ -179,24 +181,21 @@ class Memory {
     if(offsetMsize > this.msize) this.msize = BigInt(offsetMsize);
   }
 
-  store(offset, value) {
-    for (let i = 0n; i < 32n; i++) {
-      this.data[Number(offset + i)] = Number((value >> ((32n - i - 1n) * 8n)) & 0xffn);
+  store(offset, value, size = 32n) {
+    for (let i = 0n; i < size; i++) {
+      this.data[Number(offset + i)] = Number((value >> ((size - i - 1n) * 8n)) & 0xffn);
     }
     this.updateMsize(offset);
   }
 
-  store8(offset, value) {
-    this.data[Number(offset)] = Number(value & 0xffn);
-    this.updateMsize(offset);
-  }
-
-  load(offset) {
+  load(offset, length = 32n) {
     let value = 0n;
-    for (let i = 0n; i < 32n; i++) {
+    for (let i = 0n; i < length; i++) {
       value = (value << 8n) | BigInt(this.data[Number(offset + i)]);
+      console.log("value", i, numberToHexFormatted(value))
     }
-    this.updateMsize(offset, 32);
+    this.updateMsize(offset, Number(length));
+    console.log("load", value)
     return value;
   }
 }
@@ -280,7 +279,21 @@ const shrFn = (bitNum:bigint, val:bigint):bigint => val >> bitNum;
 const sarFn = (bitNum:bigint, val:bigint):bigint => shrFn(bitNum, toSigned(val));
 const byteFn = (byteNum:bigint, val:bigint):bigint => shrFn(256n - 8n /* 1 byte in bits */ - byteNum * 8n, val) & 0xFFn
 
-export default function evm(code: Uint8Array): OpResult {
+const cdLoadFn = (data: Uint8Array, byteOffset: bigint | undefined, size: bigint = 32n): bigint => {
+  const offset = byteOffset || 0n;
+  let value = 0n;
+  for (let i = 0n; i < size; i++) {
+    value = (value << 8n) | BigInt(data[Number(offset + i)] || 0);
+  }
+  return value;
+}
+
+export default function evm(
+    code: Uint8Array,
+    tx: TransactionData,
+    block: BlockData,
+    state: StateData,
+): OpResult {
   DEBUG && console.log("###", Array.from(code, (byte) => numberToHexFormatted(byte)), "###")
   let pc = 0;
   const stack:bigint[] = [];
@@ -454,16 +467,100 @@ export default function evm(code: Uint8Array): OpResult {
           DEBUG && console.log("Memory", mem.data);
           break;
         case OPCODES.MSTORE8:
-          mem.store8(stack.shift(), stack.shift());
+          mem.store(stack.shift(), stack.shift(), 1n);
           DEBUG && console.log("Memory", mem.data);
           break;
         case OPCODES.MLOAD:
           stack.unshift(mem.load(stack.shift()));
-          DEBUG && console.log("Memory", mem.data);
+          peek();
           break;
         case OPCODES.MSIZE:
           stack.unshift(mem.msize);
           DEBUG && console.log("Memory", mem.data);
+          break;
+        case OPCODES.SHA3:
+          const offset = stack.shift();
+          const length = stack.shift();
+          if (offset !== undefined && length !== undefined) {
+            const value = mem.load(offset, length);
+            const hashed = ethers.utils.keccak256(numberToHexFormatted(value));
+            stack.unshift(BigInt(hashed));
+            peek();
+          } else {
+            return error(opcode, stack);
+          }
+          break;
+        case OPCODES.ADDRESS:
+          stack.unshift(tx.address)
+          peek();
+          break;
+        case OPCODES.CALLER:
+          stack.unshift(tx.caller)
+          peek();
+          break;
+        case OPCODES.ORIGIN:
+          stack.unshift(tx.origin)
+          peek();
+          break;
+        case OPCODES.GASPRICE:
+          stack.unshift(tx.gasPrice)
+          peek();
+          break;
+        case OPCODES.CALLVALUE:
+          stack.unshift(tx.value)
+          peek();
+          break;
+        case OPCODES.CALLDATALOAD:
+          stack.unshift(cdLoadFn(tx.data, stack.shift()));
+          peek();
+          break;
+        case OPCODES.CALLDATACOPY:
+          const destOffset = stack.shift();
+          const byteOffset = stack.shift();
+          const size = stack.shift();
+          const calldata = cdLoadFn(tx.data, byteOffset, size);
+          mem.store(destOffset, calldata, size);
+          break;
+        case OPCODES.CALLDATASIZE:
+          stack.unshift(BigInt(tx.data?.length || 0));
+          peek();
+          break;
+        case OPCODES.BASEFEE:
+          stack.unshift(block.baseFee)
+          peek();
+          break;
+        case OPCODES.COINBASE:
+          stack.unshift(block.coinbase)
+          peek();
+          break;
+        case OPCODES.TIMESTAMP:
+          stack.unshift(block.timestamp)
+          peek();
+          break;
+        case OPCODES.NUMBER:
+          stack.unshift(block.number)
+          peek();
+          break;
+        case OPCODES.DIFFICULTY:
+          stack.unshift(block.difficulty)
+          peek();
+          break;
+        case OPCODES.GASLIMIT:
+          stack.unshift(block.gasLimit)
+          peek();
+          break;
+        case OPCODES.CHAINID:
+          stack.unshift(block.chainId)
+          peek();
+          break;
+        case OPCODES.BALANCE:
+          const address = stack.shift()!;
+          stack.unshift(BigInt(state[numberToHexFormatted(address)]?.balance || 0))
+          peek();
+          break;
+        case OPCODES.CODESIZE:
+          stack.unshift(BigInt(code.length))
+          peek();
           break;
       }
     }
