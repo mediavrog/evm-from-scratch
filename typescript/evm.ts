@@ -1,5 +1,5 @@
 import {ethers} from "ethers";
-import {BlockData, StateData, TransactionData} from "./types";
+import {BlockData, LogEntry, OpResult, StateData, TransactionData} from "./types";
 /**
  * EVM From Scratch
  * TypeScript template
@@ -200,12 +200,23 @@ class Memory {
   }
 }
 
-const UINT256_CEIL = 2n**256n;
+class Storage {
+  data: {[key: string]: bigint};
 
-declare interface OpResult {
-  success: boolean,
-  stack: bigint[]
+  constructor() {
+    this.data = {}
+  }
+
+  store(key, value) {
+    this.data[key] = value;
+  }
+
+  load(key): bigint {
+    return this.data[key] || 0n;
+  }
 }
+
+const UINT256_CEIL = 2n**256n;
 
 function curry(f) { // curry(f) does the currying transform
   return function(a) {
@@ -232,9 +243,9 @@ const debugOpcode = (opcode: number): string => {
   return `${OPNAMES[opcode]} (${numberToHexFormatted(opcode)})`;
 }
 
-const error = (opcode: number, currentStack: bigint[]): OpResult => {
+const error = (opcode: number, currentStack: bigint[], returnValue: bigint | undefined = undefined): OpResult => {
   DEBUG && console.log(`Operation ${debugOpcode(opcode)} on invalid stack`, currentStack);
-  return {success: false, stack: []}
+  return {success: false, stack: [], return: returnValue}
 }
 
 const toBigInt = (val: boolean): bigint => val ? 1n : 0n
@@ -256,6 +267,7 @@ const toUnsigned = (val: bigint): bigint => {
 const isPush = (opcode: number): boolean => opcode >= OPCODES.PUSH1 && opcode <= OPCODES.PUSH32;
 const isDup = (opcode: number): boolean => opcode >= OPCODES.DUP1 && opcode <= OPCODES.DUP16;
 const isSwap = (opcode: number): boolean => opcode >= OPCODES.SWAP1 && opcode <= OPCODES.SWAP16;
+const isLog = (opcode: number): boolean => opcode >= OPCODES.LOG0 && opcode <= OPCODES.LOG4;
 
 const addFn = (op1:bigint, op2:bigint):bigint => op1 + op2;
 const subFn = (op1:bigint, op2:bigint):bigint => op1 - op2;
@@ -294,6 +306,9 @@ const loadFromUint8ArrayFn = (data: Uint8Array, byteOffset: bigint | undefined, 
   return value;
 }
 
+// persistent storage
+const storage = new Storage();
+
 export default function evm(
     code: Uint8Array,
     tx: TransactionData,
@@ -303,7 +318,9 @@ export default function evm(
   DEBUG && console.log("###", Array.from(code, (byte) => numberToHexFormatted(byte)), "###")
   let pc = 0;
   const stack:bigint[] = [];
+  const logs:LogEntry[] = [];
   const mem = new Memory();
+  let returnValue: bigint | undefined = undefined;
 
   const exec2 = (opcode:number, ...operations: ((op1:bigint, op2:bigint) => bigint)[]): OpResult => {
     for (let i = 0; i < operations.length; i++) {
@@ -384,6 +401,23 @@ export default function evm(
       } else {
         error(opcode, stack);
       }
+    } else if(isLog(opcode)) {
+      const offset = stack.shift();
+      const length = stack.shift();
+      const value = mem.load(offset, length);
+      const address = tx.address;
+      const logEntry = {
+        address,
+        data: value,
+        topics: []
+      } as LogEntry
+
+      const topicsAmount = opcode - OPCODES.LOG0;
+      for(let i = 0; i < topicsAmount; i++) {
+        logEntry.topics.push(stack.shift()!)
+      }
+
+      logs.push(logEntry)
     } else {
       switch (opcode) {
         case OPCODES.POP:
@@ -484,6 +518,20 @@ export default function evm(
           stack.unshift(mem.msize);
           DEBUG && console.log("Memory", mem.data);
           break;
+        case OPCODES.SSTORE:
+          storage.store(stack.shift(), stack.shift());
+          DEBUG && console.log("Storage", storage.data);
+          break;
+        case OPCODES.SLOAD:
+          stack.unshift(storage.load(stack.shift()));
+          peek();
+          break;
+        case OPCODES.RETURN:
+          returnValue = mem.load(stack.shift(), stack.shift());
+          break;
+        case OPCODES.REVERT:
+          returnValue = mem.load(stack.shift(), stack.shift());
+          return error(opcode, stack, returnValue);
         case OPCODES.SHA3:
           const offset = stack.shift();
           const length = stack.shift();
@@ -619,5 +667,5 @@ export default function evm(
     pc++;
   }
 
-  return { success: true, stack };
+  return { success: true, stack, logs, return: returnValue };
 }

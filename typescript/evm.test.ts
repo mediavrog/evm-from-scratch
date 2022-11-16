@@ -1,7 +1,7 @@
 import { expect, test } from "@jest/globals";
 import evm from "./evm";
 import tests from "../evm.json";
-import {TransactionData, BlockData, StateData} from "./types";
+import {TransactionData, BlockData, StateData, OpResult} from "./types";
 
 for (const t of tests as any) {
   test(t.name, () => {
@@ -26,10 +26,16 @@ for (const t of tests as any) {
       chainId: BigInt(t.block?.chainid || 0),
     } as BlockData;
     const state = (t.state || {}) as StateData;
-    const result = evm(hexStringToUint8Array(t.code.bin), tx, block, state);
+    const result = evm(hexStringToUint8Array(t.code.bin), tx, block, state) as OpResult;
 
     expect(result.success).toEqual(t.expect.success);
-    expect(result.stack).toEqual(t.expect.stack.map((item) => BigInt(item)));
+    t.expect.stack && expect(result.stack).toEqual(t.expect.stack.map((item) => BigInt(item)));
+    t.expect.return && expect(result.return).toEqual(BigInt(`0x${t.expect.return}`));
+    t.expect.logs && expect(result.logs).toEqual(t.expect.logs.map((log) => ({
+      address: BigInt(log.address),
+      data: BigInt(`0x${log.data}`),
+      topics: log.topics.map((item) => BigInt(item))
+    })));
   });
 }
 

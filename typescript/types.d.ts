@@ -1,3 +1,10 @@
+declare interface OpResult {
+  success: boolean,
+  stack: bigint[],
+  logs?: LogEntry[],
+  return?: bigint | undefined,
+}
+
 export interface TransactionData {
   address: bigint,
   caller: bigint,
@@ -24,4 +31,10 @@ export interface StateData {
     code: {[key: string]: string},
     storage: {[key: string]: string}
   }
+}
+
+export interface LogEntry {
+  address: bigint,
+  data: bigint,
+  topics: bigint[]
 }
